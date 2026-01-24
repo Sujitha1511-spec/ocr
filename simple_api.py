@@ -212,9 +212,13 @@ def process_single_file(file_content: bytes, filename: str, doc_type: str) -> di
         input_tokens = 258  # Standard Gemini image token cost
         
         if doc_type == "bank":
-            result = analyze_bank_gemini_vision(image_content, filename)
-            ifsc = result.get('ifsc_code')
-            result['bank_name'] = get_bank_name_from_ifsc(ifsc or '')
+          result = analyze_bank_gemini_vision(image_content, filename)
+    
+    # ✅ FIXED: Prioritize Gemini's bank name, use IFSC only as fallback
+          gemini_bank_name = result.get('bank_name')
+          if not gemini_bank_name or gemini_bank_name == 'null':
+               ifsc = result.get('ifsc_code')
+               result['bank_name'] = get_bank_name_from_ifsc(ifsc or '')
         else:
             result = analyze_bill_gemini_vision(image_content, filename)
         
@@ -633,6 +637,225 @@ async def get_total_api_cost():
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+@app.post("/ocr/generic")
+async def process_generic_document(
+    files: List[UploadFile] = File(default=[]),
+    file: Optional[UploadFile] = File(None),
+    file_url: Optional[str] = Form(None),
+    extraction_prompt: str = Form(...),  # Required custom prompt
+    student_name: Optional[str] = Form(None),
+    scholarship_id: Optional[str] = Form(None)
+):
+    """Generic OCR - Extract anything based on user's custom prompt"""
+    try:
+        print(f"\n{'='*80}")
+        print(f"[GENERIC OCR] Processing document(s)")
+        print(f"[GENERIC OCR] Extraction prompt: {extraction_prompt[:100]}...")
+        print(f"{'='*80}")
+        
+        # Collect files
+        files_to_process = []
+        
+        if files:
+            for uploaded_file in files:
+                file_content = await uploaded_file.read()
+                files_to_process.append((file_content, uploaded_file.filename))
+        elif file:
+            file_content = await file.read()
+            files_to_process.append((file_content, file.filename))
+        elif file_url:
+            file_content, filename = download_file_from_url(file_url)
+            files_to_process.append((file_content, filename))
+        else:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "No file provided"
+            })
+        
+        print(f"[GENERIC OCR] Processing {len(files_to_process)} file(s)")
+        
+        results = []
+        total_tokens = {"input": 0, "output": 0, "total": 0}
+        
+        for file_content, filename in files_to_process:
+            validation = validate_file_format(file_content, filename)
+            if not validation['valid']:
+                results.append({
+                    "filename": filename,
+                    "success": False,
+                    "error": f"Invalid file: {validation['message']}"
+                })
+                continue
+            
+            # Use generic processing
+            result = process_generic_file(file_content, filename, extraction_prompt)
+            
+            # Calculate cost and log
+            token_usage = result.get('token_usage', {})
+            input_tok = token_usage.get('input_tokens', 0)
+            output_tok = token_usage.get('output_tokens', 0)
+            cost = calculate_cost(input_tok, output_tok, result.get('method', 'unknown'))
+            
+            log_processing(
+                doc_type="generic",
+                filename=filename,
+                method=result.get('method', 'unknown'),
+                input_tokens=input_tok,
+                output_tokens=output_tok,
+                total_tokens=token_usage.get('total_tokens', 0),
+                cost_usd=cost,
+                success=result.get('success', False),
+                error_message=result.get('error'),
+                student_name=student_name,
+                scholarship_id=scholarship_id,
+                extracted_data=result if result.get('success') else None,
+                processing_time_ms=result.get('processing_time_ms'),
+                image_url=result.get('image_url')
+            )
+            
+            if result.get('success'):
+                total_tokens["input"] += input_tok
+                total_tokens["output"] += output_tok
+                total_tokens["total"] += token_usage.get('total_tokens', 0)
+            
+            results.append({
+                "filename": filename,
+                **result
+            })
+            
+            print(f"[GENERIC OCR] ✓ Completed: {filename}")
+            print(f"[GENERIC OCR]   Cost: ${cost}")
+        
+        print(f"{'='*80}\n")
+        
+        if len(results) == 1:
+            return JSONResponse(content=results[0])
+        else:
+            return JSONResponse(content={
+                "success": True,
+                "total_files": len(results),
+                "results": results,
+                "total_token_usage": total_tokens
+            })
+        
+    except Exception as e:
+        print(f"[GENERIC OCR] ✗ Error: {str(e)}")
+        
+        log_processing(
+            doc_type="generic",
+            filename="unknown",
+            method="error",
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+            cost_usd=0.0,
+            success=False,
+            error_message=str(e),
+            student_name=student_name,
+            scholarship_id=scholarship_id
+        )
+        
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+
+
+def process_generic_file(file_content: bytes, filename: str, extraction_prompt: str) -> dict:
+    """Process any document with custom extraction prompt"""
+    start_time = time.time()
+    
+    try:
+        from ai_analyzer import analyze_generic_gemini_vision, USE_GEMINI
+        
+        def calculate_tokens(text):
+            return max(1, len(text) // 4)
+        
+        if not USE_GEMINI:
+            return {
+                "error": "Gemini Vision not configured. Please set GEMINI_API_KEY.",
+                "success": False,
+                "filename": filename
+            }
+        
+        print(f"[PROCESS] Using Gemini Vision for generic extraction...")
+        
+        # Handle PDF conversion
+        image_content = file_content
+        original_filename = filename
+        converted_from_pdf = False
+        
+        if filename.lower().endswith('.pdf'):
+            print(f"[PROCESS] Converting PDF to image...")
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_pdf:
+                temp_pdf.write(file_content)
+                temp_pdf_path = temp_pdf.name
+            
+            try:
+                from pdf2image import convert_from_path
+                images = convert_from_path(temp_pdf_path, first_page=1, last_page=1, dpi=300)
+                
+                if len(images) == 0:
+                    raise Exception("No pages in PDF")
+                
+                from io import BytesIO
+                img_byte_arr = BytesIO()
+                images[0].save(img_byte_arr, format='JPEG', quality=95)
+                
+                file_content = img_byte_arr.getvalue()
+                image_content = file_content
+                filename = filename.replace('.pdf', '.jpg').replace('.PDF', '.jpg')
+                converted_from_pdf = True
+                
+                print(f"[PROCESS] ✓ PDF converted to image")
+            except ImportError:
+                return {
+                    "error": "pdf2image not installed",
+                    "success": False,
+                    "filename": original_filename
+                }
+            finally:
+                if os.path.exists(temp_pdf_path):
+                    os.unlink(temp_pdf_path)
+        
+        # Process with Gemini Vision using custom prompt
+        input_tokens = 258
+        result = analyze_generic_gemini_vision(image_content, filename, extraction_prompt)
+        
+        # Save image
+        image_id = str(uuid.uuid4())
+        image_ext = ".jpg" if converted_from_pdf else (os.path.splitext(original_filename)[1] or ".jpg")
+        save_path = f"uploads/{image_id}{image_ext}"
+        
+        with open(save_path, "wb") as f:
+            f.write(image_content)
+        
+        base_url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000")
+        image_url = f"{base_url}/uploads/{image_id}{image_ext}"
+        
+        response_text = json.dumps(result)
+        output_tokens = calculate_tokens(response_text)
+        processing_time_ms = int((time.time() - start_time) * 1000)
+        
+        result['success'] = True
+        result['method'] = 'gemini_vision'
+        result['filename'] = original_filename
+        result['token_usage'] = {
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'total_tokens': input_tokens + output_tokens
+        }
+        result['processing_time_ms'] = processing_time_ms
+        result['image_url'] = image_url
+        
+        return result
+        
+    except Exception as e:
+        print(f"[PROCESS] ✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "error": str(e),
+            "success": False,
+            "filename": filename
+        }
 
 
 if __name__ == "__main__":

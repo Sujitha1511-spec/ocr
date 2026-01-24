@@ -477,3 +477,110 @@ def analyze_bill_from_markdown(markdown_text: str) -> Dict[str, Any]:
             'bill_date': None,
             'amount': None
         }
+
+
+def analyze_generic_gemini_vision(file_content: bytes, filename: str, user_prompt: str) -> Dict[str, Any]:
+    """
+    Generic document analysis using Gemini Vision with custom prompt
+    """
+    if not USE_GEMINI:
+        raise Exception("Gemini Vision not available - add GEMINI_API_KEY to .env")
+    
+    print(f"[GEMINI VISION] Analyzing document: {filename}")
+    print(f"[GEMINI VISION] Custom prompt: {user_prompt[:100]}...")
+    
+    try:
+        from google.genai import types
+        
+        # Detect MIME type
+        mime_type = "image/jpeg"
+        if file_content[:4] == b'\x89PNG':
+            mime_type = "image/png"
+        elif file_content[:2] == b'\xff\xd8':
+            mime_type = "image/jpeg"
+        
+        print(f"[GEMINI VISION] Format: {mime_type}, Size: {len(file_content)} bytes")
+        
+        # Build the full prompt
+        full_prompt = f"""
+You are a highly accurate OCR and data extraction AI. Analyze this document image and extract the information requested by the user.
+
+USER'S EXTRACTION REQUEST:
+{user_prompt}
+
+INSTRUCTIONS:
+1. Read all text in the image carefully, including rotated, small, or handwritten text
+2. Extract ONLY the information the user requested
+3. If a field is not found or unclear, use null
+4. IMPORTANT: Always return a JSON OBJECT, never just a string value
+5. If extracting a single value, wrap it in an object like {{"value": "extracted_value"}}
+6. Be as accurate as possible with numbers, dates, and names
+
+Return your response as a valid JSON object with the fields the user requested.
+"""
+        
+        # Call Gemini Vision
+        response = genai_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                types.Part.from_bytes(
+                    data=file_content,
+                    mime_type=mime_type
+                ),
+                full_prompt
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                response_mime_type="application/json"
+            )
+        )
+        
+        # Parse response
+        response_text = response.text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(response_text)
+        
+        # ✅ FIX: Handle different response types
+        if isinstance(data, str):
+            # If Gemini returned a plain string, wrap it
+            print(f"[GEMINI VISION] ⚠️ Received string response, wrapping in object")
+            data = {"extracted_value": data}
+        elif isinstance(data, list):
+            # If Gemini returned an array
+            print(f"[GEMINI VISION] ⚠️ Received array response")
+            if len(data) > 0:
+                if isinstance(data[0], dict):
+                    data = data[0]  # Take first object
+                else:
+                    data = {"extracted_values": data}  # Wrap array
+            else:
+                data = {"extracted_values": []}
+        elif isinstance(data, (int, float, bool)):
+            # If Gemini returned a primitive value
+            print(f"[GEMINI VISION] ⚠️ Received primitive value, wrapping in object")
+            data = {"extracted_value": data}
+        elif not isinstance(data, dict):
+            # Unknown type, wrap it
+            print(f"[GEMINI VISION] ⚠️ Unexpected type: {type(data)}, wrapping in object")
+            data = {"extracted_value": str(data)}
+        
+        # Ensure data is a dictionary
+        if not isinstance(data, dict):
+            data = {"error": "Invalid response format", "raw_response": str(data)}
+        
+        print(f"[GEMINI VISION] ✓ Extraction completed")
+        print(f"[GEMINI VISION]   Extracted {len(data)} fields")
+        
+        return data
+        
+    except json.JSONDecodeError as e:
+        print(f"[GEMINI VISION] ✗ JSON Parse Error: {e}")
+        print(f"[GEMINI VISION] Raw response: {response_text[:200]}...")
+        return {
+            "error": "Failed to parse JSON response",
+            "raw_response": response_text[:500]
+        }
+    except Exception as e:
+        print(f"[GEMINI VISION] ✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
